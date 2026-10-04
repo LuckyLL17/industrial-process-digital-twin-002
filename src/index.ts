@@ -37,14 +37,51 @@ app.get('/api/audit',async()=>audit.slice(-100));
 // Advanced operations: recipe governance, closed-loop control, maintenance windows and safety gates.
 const recipes:any[]=[{id:'recipe-r1-v3',assetId:'reactor-01',version:3,status:'approved',parameters:{temperature:75,pressure:2.7,flow:108},approvedBy:'process-engineering',approvedAt:now(),supersedes:'recipe-r1-v2'}];
 const controlCommands:any[]=[]; const maintenanceWindows:any[]=[]; const changeRequests:any[]=[];
-function recipeRisk(parameters:Record<string,number>){const violations:string[]=[];const r=assets.find(x=>x.id==='reactor-01')!;for(const k of ['temperature','pressure','flow']){const lim=r.limits[k];if(parameters[k]!=null&&(parameters[k]<lim.min||parameters[k]>lim.max))violations.push(`${k} outside operating envelope`)}const coupling=Math.abs((parameters.flow??108)-108)*.012+Math.abs((parameters.temperature??75)-75)*.018;return{violations,riskScore:Number(Math.min(1,coupling+(parameters.pressure??2.7)>3.1?.18:0).toFixed(3))};}
+const parameterUnits:Record<string,string>={temperature:'°C',pressure:'bar',flow:'m3/h',vibration:'mm/s',power:'kW'};
+type RecipeRisk={violations:string[];riskScore:number};
+class AssetNotFoundError extends Error{constructor(assetId:string){super(`asset not found: ${assetId}`);this.name='AssetNotFoundError';}}
+// Validate parameters against the asset's OWN operating envelope. reactor-01 keeps its
+// legacy coupling/risk math; other assets use a generic, deterministic envelope-distance score.
+function evaluateRecipe(assetId:string,parameters:Record<string,unknown>):RecipeRisk{
+ const a=assets.find(x=>x.id===assetId);
+ if(!a)throw new AssetNotFoundError(assetId);
+ const values=parameters??{};
+ const violations:string[]=[];
+ for(const [k,lim] of Object.entries(a.limits)){
+  const v=(values as Record<string,unknown>)[k];
+  if(v==null||v===''){violations.push(`${k} missing`);continue;}
+  const n=Number(v);
+  if(!Number.isFinite(n)){violations.push(`${k} outside operating envelope`);continue;}
+  if(n<lim.min||n>lim.max)violations.push(`${k} outside operating envelope`);
+ }
+ let riskScore:number;
+ if(a.id==='reactor-01'){
+  const p=values as Record<string,number>;
+  const coupling=Math.abs(Number(p.flow??108)-108)*.012+Math.abs(Number(p.temperature??75)-75)*.018;
+  riskScore=Number(Math.min(1,coupling+Number(p.pressure??2.7)>3.1?.18:0).toFixed(3));
+ }else{
+  let maxDistance=0;
+  for(const [k,lim] of Object.entries(a.limits)){
+   const n=Number((values as Record<string,unknown>)[k]);
+   if(!Number.isFinite(n))continue;
+   const span=lim.max-lim.min||1;
+   const over=n<lim.min?lim.min-n:n>lim.max?n-lim.max:0;
+   maxDistance=Math.max(maxDistance,over/span);
+  }
+  riskScore=Number(Math.min(1,.1+maxDistance*.9).toFixed(3));
+ }
+ return{violations,riskScore};
+}
 app.get('/api/recipes',async()=>recipes);
-app.post('/api/recipes',async(req:any,res)=>{const b=req.body as any;if(!b.assetId||!b.parameters)return res.code(400).send({error:'assetId 和 parameters 必填'});const previous=recipes.filter(x=>x.assetId===b.assetId).sort((a,b)=>b.version-a.version)[0];const risk=recipeRisk(b.parameters);const r={id:randomUUID(),assetId:b.assetId,version:(previous?.version||0)+1,status:risk.violations.length?'rejected':'pending-approval',parameters:b.parameters,risk,createdAt:now(),supersedes:previous?.id||null};recipes.push(r);log('recipe.create',r.id,r);return r;});
-app.post('/api/recipes/:id/approve',async(req:any,res)=>{const r=recipes.find(x=>x.id===(req.params as any).id);if(!r)return res.code(404).send({error:'recipe not found'});if(r.risk.violations.length)return res.code(409).send({error:'recipe violates operating envelope',violations:r.risk.violations});r.status='approved';r.approvedBy=(req.body as any)?.approvedBy||'shift-supervisor';r.approvedAt=now();log('recipe.approve',r.id,r);return r;});
-app.post('/api/recipes/:id/what-if',async(req:any,res)=>{const r=recipes.find(x=>x.id===(req.params as any).id);if(!r)return res.code(404).send({error:'recipe not found'});const params={...r.parameters,...((req.body as any)?.overrides||{})};const risk=recipeRisk(params);return{recipeId:r.id,units:{temperature:'°C',pressure:'bar',flow:'m3/h'},parameters:params,risk,estimated:{throughput:Number((params.flow*.996).toFixed(2)),quality:Number(Math.max(0,99.2-risk.riskScore*28).toFixed(2)),energy:Number((54+Math.abs(params.temperature-75)*.5+params.pressure*1.2).toFixed(2))}};});
-app.post('/api/control/commands',async(req:any,res)=>{const b=req.body as any;if(!b.assetId||!b.parameters)return res.code(400).send({error:'assetId 和 parameters 必填'});const risk=recipeRisk(b.parameters);if(risk.violations.length)return res.code(409).send({error:'command rejected by operating envelope',violations:risk.violations});const activeHigh=anomalies.some(a=>a.status!=='resolved'&&a.severity==='high'&&a.assetId===b.assetId);if(activeHigh&&!b.overrideReason)return res.code(409).send({error:'high severity anomaly requires overrideReason'});const c={id:randomUUID(),assetId:b.assetId,parameters:b.parameters,mode:b.mode||'supervised',status:'accepted',risk,issuedAt:now(),expiresAt:new Date(Date.now()+Number(b.ttlSeconds||60)*1000).toISOString()};controlCommands.push(c);log('control-command.accept',c.id,c);return c;});
+app.post('/api/recipes',async(req:any,res)=>{const b=req.body as any;if(!b.assetId||!b.parameters)return res.code(400).send({error:'assetId 和 parameters 必填'});if(!assets.some(x=>x.id===b.assetId))return res.code(404).send({error:'asset not found'});const asset=assets.find(x=>x.id===b.assetId)!;const missing=Object.keys(asset.limits).filter(k=>b.parameters[k]==null||b.parameters[k]==='');if(missing.length)return res.code(400).send({error:'缺少必需参数',missing});const previous=recipes.filter(x=>x.assetId===b.assetId).sort((a,b)=>b.version-a.version)[0];const risk=evaluateRecipe(b.assetId,b.parameters);const r={id:randomUUID(),assetId:b.assetId,version:(previous?.version||0)+1,status:risk.violations.length?'rejected':'pending-approval',parameters:b.parameters,risk,createdAt:now(),supersedes:previous?.id||null};recipes.push(r);log('recipe.create',r.id,r);return r;});
+app.post('/api/recipes/:id/approve',async(req:any,res)=>{const r=recipes.find(x=>x.id===(req.params as any).id);if(!r)return res.code(404).send({error:'recipe not found'});if(r.status==='approved')return res.code(409).send({error:'recipe already approved',status:r.status,approvedBy:r.approvedBy,approvedAt:r.approvedAt});if(r.risk.violations.length)return res.code(409).send({error:'recipe violates operating envelope',violations:r.risk.violations});r.status='approved';r.approvedBy=(req.body as any)?.approvedBy||'shift-supervisor';r.approvedAt=now();log('recipe.approve',r.id,r);return r;});
+app.post('/api/recipes/:id/what-if',async(req:any,res)=>{const r=recipes.find(x=>x.id===(req.params as any).id);if(!r)return res.code(404).send({error:'recipe not found'});const overrides=(req.body as any)?.overrides;if(overrides!==undefined&&(typeof overrides!=='object'||overrides===null||Array.isArray(overrides)))return res.code(400).send({error:'overrides 必须是参数对象'});const params={...r.parameters,...(overrides||{})};const asset=assets.find(x=>x.id===r.assetId)!;const risk=evaluateRecipe(r.assetId,params);const units=Object.fromEntries(Object.keys(asset.limits).map(k=>[k,parameterUnits[k]||'-']));const num=(v:unknown,fb:number)=>{const n=Number(v);return Number.isFinite(n)?n:fb;};const flow=num(params.flow,asset.last.flow??108),temp=num(params.temperature,asset.last.temperature??75),pressure=num(params.pressure,asset.last.pressure??2.7);return{recipeId:r.id,assetId:r.assetId,units,parameters:params,risk,estimated:{throughput:Number((flow*.996).toFixed(2)),quality:Number(Math.max(0,99.2-risk.riskScore*28).toFixed(2)),energy:Number((54+Math.abs(temp-75)*.5+pressure*1.2).toFixed(2))}};});
+app.post('/api/control/commands',async(req:any,res)=>{const b=req.body as any;if(!b.assetId||!b.parameters)return res.code(400).send({error:'assetId 和 parameters 必填'});const asset=assets.find(x=>x.id===b.assetId);if(!asset)return res.code(404).send({error:'asset not found'});const missing=Object.keys(asset.limits).filter(k=>b.parameters[k]==null||b.parameters[k]==='');if(missing.length)return res.code(400).send({error:'缺少必需参数',missing});const risk=evaluateRecipe(b.assetId,b.parameters);if(risk.violations.length)return res.code(409).send({error:'command rejected by operating envelope',violations:risk.violations});const activeHigh=anomalies.some(a=>a.status!=='resolved'&&a.severity==='high'&&a.assetId===b.assetId);if(activeHigh&&!b.overrideReason)return res.code(409).send({error:'high severity anomaly requires overrideReason'});const c={id:randomUUID(),assetId:b.assetId,parameters:b.parameters,mode:b.mode||'supervised',status:'accepted',risk,issuedAt:now(),expiresAt:new Date(Date.now()+Number(b.ttlSeconds||60)*1000).toISOString()};controlCommands.push(c);log('control-command.accept',c.id,c);return c;});
 app.post('/api/maintenance/windows',async(req:any,res)=>{const b=req.body as any;if(!b.assetId||!b.start||!b.end)return res.code(400).send({error:'assetId、start、end 必填'});const window={id:randomUUID(),assetId:b.assetId,start:b.start,end:b.end,requiredLockout:Boolean(b.requiredLockout??true),checks:{downstreamImpact:Boolean(b.downstreamImpact),sparesReady:Boolean(b.sparesReady)},status:'planned'};maintenanceWindows.push(window);return window;});
 app.post('/api/maintenance/:id/execute',async(req:any,res)=>{const w=maintenanceWindows.find(x=>x.id===(req.params as any).id);if(!w)return res.code(404).send({error:'maintenance window not found'});if(!w.checks.sparesReady)return res.code(409).send({error:'spares readiness check failed'});if(w.requiredLockout&&!(req.body as any)?.lockoutConfirmed)return res.code(409).send({error:'lockout confirmation required'});const a=assets.find(x=>x.id===w.assetId);if(a)a.state='stopped';w.status='executing';w.executedAt=now();log('maintenance.execute',w.id,w);return w;});
 app.get('/api/process/health-score',async()=>{const degraded=assets.filter(a=>a.state!=='running').length;const high=anomalies.filter(a=>a.status!=='resolved'&&a.severity==='high').length;const stale=telemetry.filter(t=>Date.now()-Date.parse(t.time)>15*60*1000).length;return{score:Number(Math.max(0,100-degraded*18-high*25-stale*2).toFixed(1)),components:{assetAvailability:assets.length?1-degraded/assets.length:1,criticalAnomalies:high,dataFreshness:telemetry.length?1-stale/telemetry.length:1},at:now()};});
 
+export{app};
+if(process.argv[1]&&/index\.(ts|js)$/.test(process.argv[1])&&!/node_modules/.test(process.argv[1])){
 app.listen({port:Number(process.env.PORT||6301),host:'127.0.0.1'}).catch(err=>{app.log.error(err);process.exit(1)});
+}
